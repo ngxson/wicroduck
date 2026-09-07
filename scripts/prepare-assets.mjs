@@ -22,6 +22,7 @@ const POLICY_BASE =
   "https://huggingface.co/pollen-robotics/microduck-policies/resolve/main";
 const POLICIES = [
   "alpha_stand.onnx", // get-up / stand-up, the one the demo screen runs
+  "alpha_walking.onnx", // velocity-commanded gait, driven by the remote
 ];
 
 const log = (...a) => console.log("[assets]", ...a);

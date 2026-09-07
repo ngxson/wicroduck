@@ -8,7 +8,8 @@
 
 import {
   ACTION_SCALE, CMD_SIZE, CTRL_DT, DECIMATION, DEFAULT_POSE, FALLEN_GZ,
-  GYRO_SENSOR, JOINT_NAMES, NUM_JOINTS, OBS_SIZE, TRUNK_BODY, UPRIGHT_GZ,
+  GYRO_SENSOR, JOINT_NAMES, NUM_JOINTS, OBS_SIZE, SWITCH_THRESHOLD, TRUNK_BODY,
+  UPRIGHT_GZ,
 } from "./microduck.ts";
 import type { PolicyRunner } from "./policy.ts";
 import type { Simulation } from "./scene.ts";
@@ -48,6 +49,8 @@ export interface Telemetry {
   simTime: number;
   /** Control steps spent in the current phase. */
   phaseSteps: number;
+  /** True while the walking policy is driving. */
+  walking: boolean;
 }
 
 export class MicroduckController {
@@ -73,8 +76,20 @@ export class MicroduckController {
   /** Fires when a get-up attempt ends: `true` if the duck is back on its feet. */
   onRecoveryEnd: ((succeeded: boolean) => void) | null = null;
 
+  /**
+   * Drive command [vx, vy, vyaw], written by the remote. Read once per control
+   * step: it selects the policy and fills the command block of the observation.
+   */
+  readonly twist = new Float32Array(3);
+
   private readonly sim: Simulation;
+  /** Balance and get-up policy: drives whenever the twist is zero, and always
+   *  during a recovery, where it was trained on an all-zero command. */
   private policy: PolicyRunner;
+  /** Locomotion policy: drives while standing with a non-zero twist. Null when
+   *  the app has none, which leaves the remote inert. */
+  private walker: PolicyRunner | null = null;
+  private walking = false;
 
   constructor(sim: Simulation, policy: PolicyRunner) {
     this.sim = sim;
@@ -112,11 +127,30 @@ export class MicroduckController {
     for (let j = 0; j < NUM_JOINTS; j++) obs[i++] = qpos[this.qposAdr[j]] - DEFAULT_POSE[j];
     for (let j = 0; j < NUM_JOINTS; j++) obs[i++] = qvel[this.dofAdr[j]];
     for (let j = 0; j < NUM_JOINTS; j++) obs[i++] = this.lastAction[j];
-    // The get-up policy was trained on an all-zero command: no twist, no head
-    // or body pose offsets. Kept explicit so other policies can fill it in.
+    // cmd = [twist(3) | head(4) | body(6)]. The standing policy was trained on
+    // all zeros; the walking one reads the twist and zeros in the other slots.
     this.cmd.fill(0);
+    if (this.walking) this.cmd.set(this.twist);
     for (let c = 0; c < CMD_SIZE; c++) obs[i++] = this.cmd[c];
     return obs;
+  }
+
+  /**
+   * The runner for this step. Walking wants the duck upright and a twist past
+   * the switch threshold; everything else is the standing policy. Swapping
+   * runners clears lastAction, which belongs to the other policy's action
+   * distribution and is part of what the new one observes.
+   */
+  private select(): PolicyRunner {
+    const [vx, vy, vyaw] = this.twist;
+    const magnitude = Math.hypot(vx, vy, vyaw);
+    const walker = this.phase === "standing" && magnitude > SWITCH_THRESHOLD ? this.walker : null;
+    const walking = walker !== null;
+    if (walking !== this.walking) {
+      this.walking = walking;
+      this.lastAction.fill(0);
+    }
+    return walker ?? this.policy;
   }
 
   private stepPhysics(): void {
@@ -131,7 +165,7 @@ export class MicroduckController {
     this.phaseSteps++;
 
     if (this.phase === "recovering" || this.phase === "standing") {
-      const action = await this.policy.run(this.buildObs());
+      const action = await this.select().run(this.buildObs());
       this.lastAction.set(action);
       for (let j = 0; j < NUM_JOINTS; j++) {
         data.ctrl[j] = DEFAULT_POSE[j] + action[j] * ACTION_SCALE;
@@ -196,6 +230,11 @@ export class MicroduckController {
   setPolicy(policy: PolicyRunner): void {
     this.policy = policy;
     this.lastAction.fill(0);
+  }
+
+  /** Install the locomotion policy the remote drives. */
+  setWalker(walker: PolicyRunner | null): void {
+    this.walker = walker;
   }
 
   get policyLabel(): string {
@@ -276,6 +315,7 @@ export class MicroduckController {
       height: this.sim.data.qpos[2],
       simTime: this.simTime,
       phaseSteps: this.phaseSteps,
+      walking: this.walking,
     };
   }
 }

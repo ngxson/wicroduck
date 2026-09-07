@@ -1,6 +1,7 @@
 <script lang="ts">
   import { CTRL_DT, OBS_SIZE, NUM_JOINTS, TIMESTEP } from "../sim/microduck.ts";
   import { type Session } from "./session.svelte";
+  import Remote from "./Remote.svelte";
 
   const { session }: { session: Session } = $props();
 
@@ -32,6 +33,11 @@
       <div><dt>Control</dt><dd class="mono">{controlHz} Hz</dd></div>
       <div><dt>Physics</dt><dd class="mono">{physicsHz} Hz</dd></div>
     </dl>
+  </section>
+
+  <section>
+    <h2>Remote</h2>
+    <Remote {session} />
   </section>
 
   <section>

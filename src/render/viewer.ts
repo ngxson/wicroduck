@@ -41,6 +41,37 @@ function meshGeometry(model: MjModel, meshId: number): THREE.BufferGeometry {
   return geo;
 }
 
+/** Time constant of the camera follow, s. Frame-rate independent, so the
+ *  gait's trunk sway is smoothed the same at 60 Hz and 240 Hz. */
+const FOLLOW_TAU = 0.12;
+
+/** Checker cell edge on the floor, m. */
+const CHECKER_CELL = 0.1;
+/** How much lighter the alternate cell is than the floor's own color. */
+const CHECKER_LIFT = 0.05;
+
+/**
+ * A 2x2 checker in the floor's color and a lighter shade of it, repeated over
+ * the plane. Mipmapped and anisotropic, so at distance it settles into the
+ * flat mean gray instead of shimmering.
+ */
+function checkerTexture(r: number, g: number, b: number, halfSize: number, anisotropy: number): THREE.Texture {
+  const lift = (v: number) => Math.min(1, v + CHECKER_LIFT);
+  const dark = [r, g, b].map((v) => Math.round(v * 255));
+  const light = [r, g, b].map((v) => Math.round(lift(v) * 255));
+  const data = new Uint8Array([...dark, 255, ...light, 255, ...light, 255, ...dark, 255]);
+  const tex = new THREE.DataTexture(data, 2, 2);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(halfSize / CHECKER_CELL, halfSize / CHECKER_CELL);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.LinearMipmapLinearFilter;
+  tex.generateMipmaps = true;
+  tex.anisotropy = anisotropy;
+  tex.needsUpdate = true;
+  return tex;
+}
+
 /** Primitive geoms, sized so a unit build can be scaled by geom_size. */
 function primitiveGeometry(type: number, size: Float64Array | number[]): THREE.BufferGeometry | null {
   switch (type) {
@@ -64,6 +95,13 @@ function primitiveGeometry(type: number, size: Float64Array | number[]): THREE.B
   }
 }
 
+/** One physics step's worth of geom poses and the followed body's position. */
+interface Pose {
+  xpos: Float64Array;
+  xmat: Float64Array;
+  follow: Float64Array;
+}
+
 export interface ViewerOptions {
   /** Follow the trunk with the camera target instead of orbiting a fixed point. */
   followBody?: number;
@@ -82,8 +120,15 @@ export class Viewer {
   /** One geometry per mesh asset, shared by every geom referencing it; owned
    *  here so it is disposed once rather than once per geom. */
   private meshCache = new Map<number, THREE.BufferGeometry>();
+  private prev: Pose = { xpos: new Float64Array(0), xmat: new Float64Array(0), follow: new Float64Array(3) };
+  private curr: Pose = { xpos: new Float64Array(0), xmat: new Float64Array(0), follow: new Float64Array(3) };
   private readonly followTarget = new THREE.Vector3();
+  private readonly followDelta = new THREE.Vector3();
   private followBody: number | null = null;
+  /** Shadow-casting light, kept over the followed body so the tight shadow
+   *  frustum travels with the robot. */
+  private readonly key: THREE.DirectionalLight;
+  private readonly keyOffset = new THREE.Vector3(0.6, 1.2, 0.5);
   private readonly resizeObserver: ResizeObserver;
   private readonly mat = new THREE.Matrix4();
 
@@ -115,7 +160,7 @@ export class Viewer {
     const hemi = new THREE.HemisphereLight(0x9fb4d0, 0x20242c, 1.5);
     this.scene.add(hemi);
     const key = new THREE.DirectionalLight(0xffffff, 2.4);
-    key.position.set(0.6, 1.2, 0.5);
+    key.position.copy(this.keyOffset);
     key.castShadow = true;
     key.shadow.mapSize.set(2048, 2048);
     // Tight ortho frustum: the whole robot is ~25 cm tall, so the default
@@ -126,6 +171,8 @@ export class Viewer {
     key.shadow.camera.near = 0.1; key.shadow.camera.far = 4;
     key.shadow.bias = -0.0015;
     this.scene.add(key);
+    this.scene.add(key.target);
+    this.key = key;
     this.scene.add(new THREE.DirectionalLight(0xbcd4ff, 0.5).translateX(-1).translateY(0.5));
 
     this.resizeObserver = new ResizeObserver(() => this.resize());
@@ -166,18 +213,24 @@ export class Viewer {
       const rgba = matid >= 0 ? model.mat_rgba : model.geom_rgba;
       const base = matid >= 0 ? matid * 4 : g * 4;
       const isCollision = group === GROUP_COLLISION;
+      const isPlane = type === GEOM.PLANE;
+      // The floor carries its color in the checker; every other geom in the material.
+      const map = isPlane
+        ? checkerTexture(rgba[base], rgba[base + 1], rgba[base + 2], size[0] || 10, this.renderer.capabilities.getMaxAnisotropy())
+        : null;
       const material = new THREE.MeshStandardMaterial({
-        color: new THREE.Color(rgba[base], rgba[base + 1], rgba[base + 2]),
+        color: isPlane ? 0xffffff : new THREE.Color(rgba[base], rgba[base + 1], rgba[base + 2]),
+        map,
         opacity: isCollision ? 0.35 : rgba[base + 3],
         transparent: isCollision || rgba[base + 3] < 1,
-        roughness: type === GEOM.PLANE ? 0.95 : 0.55,
-        metalness: type === GEOM.PLANE ? 0 : 0.15,
+        roughness: isPlane ? 0.95 : 0.55,
+        metalness: isPlane ? 0 : 0.15,
         wireframe: isCollision,
       });
 
       const mesh = new THREE.Mesh(geometry, material);
       mesh.userData.meshId = meshId;
-      mesh.castShadow = type !== GEOM.PLANE;
+      mesh.castShadow = !isPlane;
       mesh.receiveShadow = true;
       mesh.visible = !isCollision;
       mesh.matrixAutoUpdate = false;
@@ -191,19 +244,51 @@ export class Viewer {
     for (const m of this.collisionObjects) m.visible = visible;
   }
 
-  /** Copy the current MuJoCo geom poses onto the render objects. */
+  /**
+   * Snapshot the MuJoCo geom poses. Called once per physics step; the pose
+   * before it is kept so render() can blend between the two.
+   */
   sync(model: MjModel, data: MjData): void {
-    const xpos = data.geom_xpos;
-    const xmat = data.geom_xmat;
-    for (let g = 0; g < model.ngeom; g++) {
+    const n = model.ngeom;
+    if (this.curr.xpos.length !== n * 3) {
+      this.curr = { xpos: new Float64Array(n * 3), xmat: new Float64Array(n * 9), follow: new Float64Array(3) };
+      this.prev = { xpos: new Float64Array(n * 3), xmat: new Float64Array(n * 9), follow: new Float64Array(3) };
+      this.copyPose(this.prev, data);
+    } else {
+      [this.prev, this.curr] = [this.curr, this.prev];
+    }
+    this.copyPose(this.curr, data);
+  }
+
+  private copyPose(into: Pose, data: MjData): void {
+    into.xpos.set(data.geom_xpos.subarray(0, into.xpos.length));
+    into.xmat.set(data.geom_xmat.subarray(0, into.xmat.length));
+    if (this.followBody !== null) into.follow.set(data.body(this.followBody).xpos.subarray(0, 3));
+  }
+
+  /**
+   * Write the poses onto the render objects, blended between the last two
+   * snapshots by alpha in [0, 1]. Physics ticks at 50 Hz and the display at
+   * whatever it likes; without the blend every sixth frame at 60 Hz repeats
+   * a pose while the camera keeps gliding, which reads as judder.
+   */
+  private blend(alpha: number, dt: number): void {
+    const a = this.prev, b = this.curr;
+    const t = alpha, u = 1 - alpha;
+    for (let g = 0; g < this.geomObjects.length; g++) {
       const obj = this.geomObjects[g];
       if (!obj) continue;
       const p = g * 3, m = g * 9;
+      const px = u * a.xpos[p] + t * b.xpos[p];
+      const py = u * a.xpos[p + 1] + t * b.xpos[p + 1];
+      const pz = u * a.xpos[p + 2] + t * b.xpos[p + 2];
       // MuJoCo stores row-major 3x3; three.js Matrix4.set takes row-major too.
+      // A linear blend of two rotations 20 ms apart stays orthonormal to well
+      // under a pixel.
       this.mat.set(
-        xmat[m + 0], xmat[m + 1], xmat[m + 2], xpos[p + 0],
-        xmat[m + 3], xmat[m + 4], xmat[m + 5], xpos[p + 1],
-        xmat[m + 6], xmat[m + 7], xmat[m + 8], xpos[p + 2],
+        u * a.xmat[m + 0] + t * b.xmat[m + 0], u * a.xmat[m + 1] + t * b.xmat[m + 1], u * a.xmat[m + 2] + t * b.xmat[m + 2], px,
+        u * a.xmat[m + 3] + t * b.xmat[m + 3], u * a.xmat[m + 4] + t * b.xmat[m + 4], u * a.xmat[m + 5] + t * b.xmat[m + 5], py,
+        u * a.xmat[m + 6] + t * b.xmat[m + 6], u * a.xmat[m + 7] + t * b.xmat[m + 7], u * a.xmat[m + 8] + t * b.xmat[m + 8], pz,
         0, 0, 0, 1,
       );
       obj.matrix.copy(this.mat);
@@ -211,14 +296,26 @@ export class Viewer {
     }
 
     if (this.followBody !== null) {
-      const bp = data.body(this.followBody).xpos;
+      const f = a.follow, g = b.follow;
       // Body pose is in MuJoCo's z-up frame; the root carries the flip.
-      this.followTarget.set(bp[0], bp[1], bp[2]).applyQuaternion(Z_UP);
-      this.controls.target.lerp(this.followTarget, 0.15);
+      this.followTarget
+        .set(u * f[0] + t * g[0], u * f[1] + t * g[1], u * f[2] + t * g[2])
+        .applyQuaternion(Z_UP);
+      // Camera and target move together, so the orbit offset the user set is
+      // kept while the robot walks off.
+      const k = 1 - Math.exp(-dt / FOLLOW_TAU);
+      this.followDelta.copy(this.followTarget).sub(this.controls.target).multiplyScalar(k);
+      this.controls.target.add(this.followDelta);
+      this.camera.position.add(this.followDelta);
+      this.key.target.position.copy(this.controls.target);
+      this.key.position.copy(this.controls.target).add(this.keyOffset);
     }
   }
 
-  render(): void {
+  /** Draw, with the geoms blended alpha of the way from the previous
+   *  snapshot to the current one; dt is the wall time since the last draw. */
+  render(alpha = 1, dt = 1 / 60): void {
+    if (this.curr.xpos.length) this.blend(alpha, dt);
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }
@@ -251,7 +348,10 @@ export class Viewer {
       if (!this.meshCache.has(obj.userData.meshId ?? -1)) obj.geometry.dispose();
       const mat = obj.material;
       if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
-      else mat.dispose();
+      else {
+        if ("map" in mat) (mat.map as THREE.Texture | null)?.dispose();
+        mat.dispose();
+      }
     }
     for (const geo of this.meshCache.values()) geo.dispose();
     this.meshCache = new Map();

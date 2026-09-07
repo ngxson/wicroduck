@@ -15,6 +15,8 @@ import { assetUrl } from "../asset-url.ts";
 
 export const POLICY_NAME = "alpha_stand.onnx";
 const POLICY_URL = assetUrl(`policies/${POLICY_NAME}`);
+export const WALK_POLICY_NAME = "alpha_walking.onnx";
+const WALK_POLICY_URL = assetUrl(`policies/${WALK_POLICY_NAME}`);
 
 /** Where a policy came from. `checkpoint` entries are runs trained here. */
 export interface PolicyOption {
@@ -54,6 +56,8 @@ export class Session {
   uprightPct = $state(0);
   heightCm = $state(0);
   policyHz = $state(0);
+  /** True while the walking policy is driving. */
+  walking = $state(false);
 
   /** Everything the viewport can be driven by: the shipped checkpoint plus
    *  every run saved from the Train workspace. */
@@ -114,9 +118,12 @@ export class Session {
       if (this.#disposed) return;
       this.#sim = sim;
 
-      this.loadStage = "Loading policy";
+      this.loadStage = "Loading policies";
       this.loadProgress = 100;
-      const policy = await Policy.load(POLICY_URL);
+      const [policy, walker] = await Promise.all([
+        Policy.load(POLICY_URL),
+        Policy.load(WALK_POLICY_URL),
+      ]);
       if (this.#disposed) return;
 
       const trunkId = sim.mujoco.mj_name2id(
@@ -131,6 +138,7 @@ export class Session {
       // something else happens to trigger a refresh.
       await this.refreshPolicies();
       const controller = new MicroduckController(sim, policy);
+      controller.setWalker(walker);
       controller.onRecoveryEnd = () => {
         if (!this.#autoRepeat) return;
         this.#repeatTimer = setTimeout(() => controller.knockDown(), REPEAT_DELAY_MS);
@@ -181,6 +189,7 @@ export class Session {
       while (accumulator >= CTRL_DT) {
         accumulator -= CTRL_DT;
         await controller.step();
+        viewer.sync(sim.model, sim.data);
         steps++;
       }
 
@@ -195,9 +204,11 @@ export class Session {
       this.phase = t.phase;
       this.uprightPct = Math.round(Math.max(0, -t.gravityZ) * 100);
       this.heightCm = Math.round(t.height * 1000) / 10;
+      this.walking = t.walking;
 
-      viewer.sync(sim.model, sim.data);
-      viewer.render();
+      // Draw the pose the leftover sub-step time points at, so a 50 Hz robot
+      // glides on a 60 Hz display instead of repeating every sixth frame.
+      viewer.render(accumulator / CTRL_DT, dt);
       this.#frame = requestAnimationFrame(() => void tick());
     };
     void tick();
@@ -257,6 +268,11 @@ export class Session {
 
   standUp(): void {
     this.#controller?.standUp();
+  }
+
+  /** Drive command from the remote: forward m/s, left m/s, yaw rad/s. */
+  setTwist(vx: number, vy: number, vyaw: number): void {
+    this.#controller?.twist.set([vx, vy, vyaw]);
   }
 
   reset(): void {

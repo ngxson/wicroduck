@@ -63,6 +63,19 @@ export const JOINT_LIMITS: readonly (readonly [number, number])[] = [
 
 export const ACTION_SCALE = 1.0;
 
+/**
+ * Drive command, as the real robot's gamepad daemon (microduck/padd) shapes it:
+ * cmd[0..3] = [vx forward m/s, vy left m/s, vyaw rad/s], each a stick axis
+ * scaled by its full-deflection maximum. Deflection below the deadzone reads
+ * as centre, so a resting stick never makes the duck creep.
+ */
+export const MAX_LINEAR = 1.0;
+export const MAX_ANGULAR = 3.0;
+export const STICK_DEADZONE = 0.1;
+/** Twist magnitude above which the walking policy drives instead of the
+ *  standing one, from infer_policy.py's switch_threshold. */
+export const SWITCH_THRESHOLD = 0.05;
+
 /** Physics runs at 200 Hz, the policy at 50 Hz — the training decimation. */
 export const TIMESTEP = 0.005;
 export const DECIMATION = 4;
